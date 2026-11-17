@@ -1,142 +1,188 @@
-function renderizarLista(registros) {
-  const contenedor = document.getElementById('lista-registros');
-  if (!contenedor) return;
-
-  if (!registros || registros.length === 0) {
-    contenedor.innerHTML = '<p>No hay registros en IndexedDB.</p>';
-    return;
+function actualizarIndicadorRed() {
+  const badge = document.getElementById('badge-red');
+  if (!badge) return;
+  if (navigator.onLine) {
+    badge.textContent = 'En Línea';
+    badge.className = 'badge online';
+  } else {
+    badge.textContent = 'Sin Conexión';
+    badge.className = 'badge offline';
   }
-
-  const filas = registros.map(function (registro) {
-    return (
-      '<tr>' +
-        '<td>' + registro.id + '</td>' +
-        '<td>' + registro.cliente + '</td>' +
-        '<td>' + registro.monto + '</td>' +
-        '<td>' + new Date(registro.fecha).toLocaleString() + '</td>' +
-      '</tr>'
-    );
-  }).join('');
-
-  contenedor.innerHTML =
-    '<table border="1" cellpadding="6">' +
-      '<thead>' +
-        '<tr>' +
-          '<th>ID</th>' +
-          '<th>Cliente</th>' +
-          '<th>Monto</th>' +
-          '<th>Fecha</th>' +
-        '</tr>' +
-      '</thead>' +
-      '<tbody>' + filas + '</tbody>' +
-    '</table>';
 }
 
-function mostrarError(error) {
-  console.error('Error en IndexedDB:', error);
-  alert('Ocurrió un error. Revisa la consola y DevTools > Application > IndexedDB.');
+function procesarEnvioReporte(datosFormulario) {
+  const endpoint = 'https://jsonplaceholder.typicode.com/posts';
+
+  return fetch(endpoint, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(datosFormulario)
+  })
+    .then(function (respuesta) {
+      if (!respuesta.ok) throw new Error('Error HTTP del servidor');
+      return respuesta.json();
+    })
+    .then(function () {
+      // Envío en vivo OK → bitácora local 'sincronizado'
+      return guardarRegistro({
+        titulo: datosFormulario.titulo,
+        descripcion: datosFormulario.descripcion,
+        estado: 'sincronizado',
+        fechaCreacion: Date.now()
+      });
+    })
+    .catch(function () {
+      // Falla de red → encolar como 'pendiente'
+      console.warn('[Outbox] Sin conexión. Encolando transacción localmente...');
+      return guardarRegistro({
+        titulo: datosFormulario.titulo,
+        descripcion: datosFormulario.descripcion,
+        estado: 'pendiente',
+        fechaCreacion: Date.now()
+      });
+    })
+    .then(function () {
+      return renderizarColaOutbox();
+    });
+}
+
+function sincronizarPendientes() {
+  console.log('[Outbox] Conexión detectada. Buscando registros pendientes...');
+
+  return obtenerTodosLosRegistros()
+    .then(function (registros) {
+      const pendientes = registros.filter(function (item) {
+        return item.estado === 'pendiente';
+      });
+
+      if (pendientes.length === 0) {
+        console.log('[Outbox] No hay transacciones pendientes por sincronizar.');
+        return;
+      }
+
+      // Convertir cada pendiente en una promesa de envío + actualización
+      const promesasDeEnvio = pendientes.map(function (item) {
+        return fetch('https://jsonplaceholder.typicode.com/posts', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ title: item.titulo, body: item.descripcion })
+        })
+          .then(function (res) {
+            if (!res.ok) throw new Error('Falla al reintentar envío');
+            return actualizarEstadoRegistro(item.id, 'sincronizado');
+          });
+      });
+
+      return Promise.all(promesasDeEnvio);
+    })
+    .then(function () {
+      return renderizarColaOutbox();
+    })
+    .catch(function (error) {
+      console.error('[Outbox] Error durante la sincronización masiva:', error);
+    });
+}
+
+function renderizarColaOutbox() {
+  return obtenerTodosLosRegistros()
+    .then(function (registros) {
+      const lista = document.getElementById('lista-outbox');
+      if (!lista) return;
+      lista.innerHTML = '';
+
+      if (registros.length === 0) {
+        const vacio = document.createElement('li');
+        vacio.className = 'vacio';
+        vacio.textContent = 'No hay transacciones en la bandeja.';
+        lista.appendChild(vacio);
+        return;
+      }
+
+      registros.forEach(function (item) {
+        const li = document.createElement('li');
+        li.className = item.estado;
+
+        const titulo = document.createElement('strong');
+        titulo.textContent = item.titulo || '(Sin título)';
+
+        const estado = document.createElement('span');
+        estado.className = 'estado ' + item.estado;
+        estado.textContent = item.estado;
+
+        const hora = document.createElement('small');
+        const fecha = item.fechaCreacion ? new Date(item.fechaCreacion) : new Date();
+        hora.textContent = fecha.toLocaleString();
+
+        li.appendChild(titulo);
+        li.appendChild(estado);
+        li.appendChild(hora);
+        lista.appendChild(li);
+      });
+    })
+    .catch(function (err) {
+      console.error('[Outbox] Error al renderizar cola:', err);
+    });
+}
+
+function conectarFormulario() {
+  const form = document.getElementById('form-incidencia');
+  if (!form) return;
+
+  form.addEventListener('submit', function (e) {
+    e.preventDefault();
+
+    const titulo = document.getElementById('titulo').value.trim();
+    const descripcion = document.getElementById('descripcion').value.trim();
+    if (!titulo || !descripcion) return;
+
+    procesarEnvioReporte({ titulo: titulo, descripcion: descripcion })
+      .then(function () { form.reset(); })
+      .catch(function (err) { console.error('[Outbox] Error al procesar envío:', err); });
+  });
+}
+
+function conectarBotonPurgar() {
+  const btn = document.getElementById('btn-purgar');
+  if (!btn) return;
+
+  btn.addEventListener('click', function () {
+    obtenerTodosLosRegistros()
+      .then(function (registros) {
+        const sincronizados = registros.filter(function (item) {
+          return item.estado === 'sincronizado';
+        });
+        if (sincronizados.length === 0) {
+          console.log('[Outbox] No hay registros sincronizados para purgar.');
+          return;
+        }
+        const promesasDeBorrado = sincronizados.map(function (item) {
+          return eliminarRegistro(item.id);
+        });
+        return Promise.all(promesasDeBorrado);
+      })
+      .then(function () { return renderizarColaOutbox(); })
+      .catch(function (err) { console.error('[Outbox] Error al purgar:', err); });
+  });
 }
 
 document.addEventListener('DOMContentLoaded', function () {
-  const btnGuardar = document.getElementById('btn-guardar');
-  const btnLeer = document.getElementById('btn-leer');
-  const btnBorrarUltimo = document.getElementById('btn-borrar');
-  const btnVaciar = document.getElementById('btn-vaciar');
+  actualizarIndicadorRed();
+  conectarFormulario();
+  conectarBotonPurgar();
+  renderizarColaOutbox();
 
-  if (btnGuardar) {
-    btnGuardar.addEventListener('click', function () {
-      const nuevoRegistro = {
-        cliente: 'Cliente de prueba ' + Date.now(),
-        monto: Math.floor(Math.random() * 1000) + 1,
-        fecha: Date.now(),
-        estado: 'pendiente'
-      };
-
-      guardarRegistro(nuevoRegistro)
-        .then(function (idGenerado) {
-          console.log('Registro guardado con ID:', idGenerado);
-          return obtenerTodosLosRegistros();
-        })
-        .then(function (lista) {
-          console.table(lista);
-          renderizarLista(lista);
-        })
-        .catch(mostrarError);
-    });
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('./sw.js')
+      .then(function (reg) { console.log('[SW] Registrado. Scope:', reg.scope); })
+      .catch(function (err) { console.error('[SW] Error:', err); });
   }
+});
 
-  // -------------------------------------------------------
-  // Leer todos los registros
-  // -------------------------------------------------------
-  if (btnLeer) {
-    btnLeer.addEventListener('click', function () {
-      obtenerTodosLosRegistros()
-        .then(function (lista) {
-          console.table(lista);
-          renderizarLista(lista);
-        })
-        .catch(mostrarError);
-    });
-  }
+window.addEventListener('online', function () {
+  actualizarIndicadorRed();
+  sincronizarPendientes();
+});
 
-  if (btnBorrarUltimo) {
-    btnBorrarUltimo.addEventListener('click', function () {
-      obtenerTodosLosRegistros()
-        .then(function (lista) {
-          if (!lista || lista.length === 0) {
-            alert('No hay registros para borrar.');
-            return null;
-          }
-
-          const ultimo = lista[lista.length - 1];
-          return eliminarRegistro(ultimo.id).then(function () {
-            console.log('Registro eliminado con ID:', ultimo.id);
-            return obtenerTodosLosRegistros();
-          });
-        })
-        .then(function (listaActualizada) {
-          if (listaActualizada) {
-            console.table(listaActualizada);
-            renderizarLista(listaActualizada);
-          }
-        })
-        .catch(mostrarError);
-    });
-  }
-
-  if (btnVaciar) {
-    btnVaciar.addEventListener('click', function () {
-      obtenerTodosLosRegistros()
-        .then(function (lista) {
-          if (!lista || lista.length === 0) {
-            alert('La cola ya está vacía.');
-            return null;
-          }
-
-          const promesasDeBorrado = lista.map(function (registro) {
-            return eliminarRegistro(registro.id);
-          });
-
-          return Promise.all(promesasDeBorrado);
-        })
-        .then(function (resultado) {
-          if (resultado) {
-            console.log('Registros eliminados:', resultado.length);
-            return obtenerTodosLosRegistros();
-          }
-          return null;
-        })
-        .then(function (listaActualizada) {
-          if (listaActualizada) {
-            console.table(listaActualizada);
-            renderizarLista(listaActualizada);
-          }
-        })
-        .catch(mostrarError);
-    });
-  }
-
-  obtenerTodosLosRegistros()
-    .then(renderizarLista)
-    .catch(mostrarError);
+window.addEventListener('offline', function () {
+  actualizarIndicadorRed();
 });
